@@ -10,7 +10,7 @@ checksum = "8e924479d38dab35ad7dae658abe8429467c5ca109a72e50ce61e8e616fd6487"
 
 [[package]]
 name = "git-rcrypt"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "ggstd",
 ]

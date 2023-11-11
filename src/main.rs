@@ -3,30 +3,30 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::io::Error;
-use std::io::Read;
 use std::io::Write;
 
 use ggstd::crypto::aes;
 use ggstd::crypto::cipher::{self, Stream};
 use ggstd::crypto::hmac::HMAC;
 use ggstd::crypto::rand;
-use ggstd::crypto::sha1;
-use ggstd::encoding::binary::{ByteOrder, BIG_ENDIAN};
+use ggstd::crypto::sha256;
 use ggstd::hash::Hash;
 use std::process::{Command, Stdio};
 
-const VERSION: &str = "0.0.1";
+const VERSION: &str = "0.0.2";
 
 fn print_usage(program_name: &str, out: &mut dyn std::io::Write) {
     writeln!(
         out,
-        "Usage: {} COMMAND [ARGS ...]
+        r#"Usage: {} COMMAND [ARGS ...]
 
-Common commands:
-  init                 generate a key and prepare repo to use git-rcrypt
-  lock                 de-configure git-rcrypt and re-encrypt files in work tree
-  unlock KEYFILE       decrypt this repo using the given symmetric key
-",
+Commands:
+  init             Initialize the git repository to use encryption.
+  lock             Deconfigure git-rcrypt and reencrypt unlocked files in the work tree.
+  unlock KEYFILE   Decrypt this repo using the key from KEYFILE.
+                   If KEYFILE is "-", the key will be read from the standard input.
+
+"#,
         program_name
     )
     .unwrap();
@@ -34,33 +34,6 @@ Common commands:
 
 fn print_version(out: &mut dyn std::io::Write) {
     writeln!(out, "git-rcrypt {}", VERSION).unwrap();
-}
-
-fn help(program_name: &str, args: &[&str]) -> Result<(), Error> {
-    if args.is_empty() {
-        print_usage(program_name, &mut std::io::stdout());
-    } else {
-        let out = &mut std::io::stdout();
-        let command = args[0];
-        match command {
-            "init" => help_init(out),
-            "unlock" => help_unlock(out),
-            "lock" => help_lock(out),
-            _ => {
-                eprint!(
-                    "'{}' is not a git-rcrypt command. See 'git-rcrypt help'.",
-                    args[0]
-                );
-                std::process::exit(1);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn version() -> Result<(), Error> {
-    print_version(&mut std::io::stdout());
-    Ok(())
 }
 
 fn main() {
@@ -96,15 +69,19 @@ fn main() {
     let args = &args[1..];
 
     let res = match command {
-        // Public commands:
-        "help" => help(program_name, args),
-        "version" => version(),
-        "init" => init(args),
+        "help" => {
+            print_usage(program_name, &mut std::io::stdout());
+            Ok(())
+        }
+        "version" => {
+            print_version(&mut std::io::stdout());
+            Ok(())
+        }
+        "init" => init(),
         "unlock" => unlock(args),
-        "lock" => lock(args),
-        // Plumbing commands (executed by git, not by user):
-        "clean" => clean(args),
-        "smudge" => smudge(args),
+        "lock" => lock(),
+        "clean" => clean(),
+        "smudge" => smudge(),
         "diff" => diff(args),
         _ => {
             eprintln!(
@@ -121,10 +98,11 @@ fn main() {
     }
 }
 
-const GITCRYPT_FILE_HEADER: &[u8; 10] = b"\0GITCRYPT\0";
-const ENCRYPTED_FILE_MARKER_SIZE: usize = 10;
-const NONCE_LEN: usize = 12;
-const ENCRYPTED_FILE_HEADER_SIZE: usize = ENCRYPTED_FILE_MARKER_SIZE + NONCE_LEN;
+const ENC_FILE_MARKER_SIZE: usize = 8;
+const ENC_FILE_MARKER: &[u8; ENC_FILE_MARKER_SIZE] = b"GRCRPT\x00\x01";
+const AES_KEY_SIZE: usize = 32; // AES-256
+const HMAC_SIZE: usize = 32; //sha256 HMAC
+const ENC_FILE_HEADER_SIZE: usize = ENC_FILE_MARKER_SIZE + HMAC_SIZE;
 
 fn git_config(name: &str, value: &str) -> std::io::Result<()> {
     exec_git(&["config", name, value], "'git config' failed")
@@ -167,7 +145,6 @@ fn configure_git_filters() -> std::io::Result<()> {
 }
 
 fn deconfigure_git_filters() -> std::io::Result<()> {
-    // deconfigure the git-rcrypt filters
     if git_has_config("filter.git-rcrypt.smudge")?
         || git_has_config("filter.git-rcrypt.clean")?
         || git_has_config("filter.git-rcrypt.required")?
@@ -204,8 +181,8 @@ fn git_checkout(paths: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn get_internal_state_path() -> std::io::Result<String> {
-    // git rev-parse --git-dir
+/// Return path to the .git directory of the current git repository.
+fn get_repo_root() -> std::io::Result<String> {
     let output = exec_git_for_output(
         &["rev-parse", "--git-dir"],
         true,
@@ -214,18 +191,14 @@ fn get_internal_state_path() -> std::io::Result<String> {
     if output.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "git dir is not found",
+            ".git directory is not found",
         ));
     }
-    Ok(format!("{}/git-rcrypt", output))
+    Ok(output)
 }
 
-fn get_internal_keys_path() -> std::io::Result<String> {
-    Ok(format!("{}/keys", get_internal_state_path()?))
-}
-
-fn get_internal_key_path() -> std::io::Result<String> {
-    Ok(format!("{}/default", get_internal_keys_path()?))
+fn get_key_path() -> std::io::Result<String> {
+    Ok(format!("{}/git-rcrypt.key", get_repo_root()?))
 }
 
 fn get_path_to_top() -> std::io::Result<String> {
@@ -327,7 +300,7 @@ fn get_encrypted_files() -> std::io::Result<Vec<String>> {
 }
 
 fn load_key() -> std::io::Result<Key> {
-    let key_path = std::path::PathBuf::from(get_internal_key_path()?);
+    let key_path = std::path::PathBuf::from(get_key_path()?);
     let mut f = std::fs::File::open(key_path)?;
     Key::load(&mut f)
 }
@@ -337,25 +310,23 @@ fn encrypt_file(
     r: &mut dyn std::io::Read,
     w: &mut dyn std::io::Write,
 ) -> std::io::Result<()> {
-    // Read the entire file into memory
+    // read the entire file into memory
     let mut data = Vec::with_capacity(4 * 1024 * 1024);
     r.read_to_end(&mut data)?;
 
-    // Calculate hmac
-    let mut hmac = HMAC::new(sha1::Digest::new, &key.hmac_key);
+    // calculate hmac
+    let mut hmac = HMAC::new(sha256::Digest::new, &key.key);
     hmac.write_all(&data).unwrap();
     let digest = hmac.sum(&[]);
 
-    // Write a header that...
-    w.write_all(b"\0GITCRYPT\0")?; // ...identifies this as an encrypted file
-    w.write_all(&digest[..NONCE_LEN])?; // ...includes the nonce
+    // write header
+    w.write_all(ENC_FILE_MARKER)?; // ...identifies this as an encrypted file
+    w.write_all(&digest[..HMAC_SIZE])?; // ...includes the nonce
 
-    // Now encrypt the file
-    let mut iv: [u8; 16] = [0; 16];
-    iv[..NONCE_LEN].copy_from_slice(&digest[..NONCE_LEN]);
-
-    let block = aes::Cipher::new(&key.aes_key).unwrap();
-    let mut stream = cipher::CTR::new(&block, &iv);
+    // encrypt the file
+    let iv = &digest[..aes::BLOCK_SIZE];
+    let block = aes::Cipher::new(&key.key).unwrap();
+    let mut stream = cipher::CTR::new(&block, iv);
     stream.xor_key_stream_inplace(&mut data);
     w.write_all(&data)?;
     w.flush()?;
@@ -363,32 +334,47 @@ fn encrypt_file(
 }
 
 /// Encrypt contents of stdin and write to stdout
-fn clean(args: &[&str]) -> Result<(), Error> {
-    if !args.is_empty() {
-        eprintln!("parameters to clean command are not supported");
-        std::process::exit(1);
-    }
-    let key = load_key()?;
+fn clean() -> Result<(), Error> {
     encrypt_file(
-        &key,
+        &load_key()?,
         &mut std::io::stdin().lock(),
         &mut std::io::stdout().lock(),
     )
 }
 
+/// Decrypt file and return true if the file was encrypted before.
+fn decrypt_file(
+    key: &Key,
+    r: &mut dyn std::io::Read,
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<bool> {
+    let mut header = [0; ENC_FILE_HEADER_SIZE];
+    let n = r.read(&mut header)?;
+    if n != ENC_FILE_HEADER_SIZE || &header[..ENC_FILE_MARKER_SIZE] != ENC_FILE_MARKER {
+        w.write_all(&header[..n])?;
+        std::io::copy(r, w)?;
+        Ok(false)
+    } else {
+        decrypt_file_after_header(
+            key,
+            &header[ENC_FILE_MARKER_SIZE..ENC_FILE_HEADER_SIZE],
+            r,
+            w,
+        )?;
+        Ok(true)
+    }
+}
+
 fn decrypt_file_after_header(
     key: &Key,
-    nonce: &[u8],
+    digest: &[u8],
     r: &mut dyn std::io::Read,
     w: &mut dyn std::io::Write,
 ) -> std::io::Result<()> {
-    assert_eq!(NONCE_LEN, nonce.len());
-    let mut iv: [u8; 16] = [0; 16];
-    iv[..NONCE_LEN].copy_from_slice(nonce);
-
-    let block = aes::Cipher::new(&key.aes_key).unwrap();
-    let mut stream = cipher::CTR::new(&block, &iv);
-    let mut hmac = HMAC::new(sha1::Digest::new, &key.hmac_key);
+    let iv = &digest[..aes::BLOCK_SIZE];
+    let block = aes::Cipher::new(&key.key).unwrap();
+    let mut stream = cipher::CTR::new(&block, iv);
+    let mut hmac = HMAC::new(sha256::Digest::new, &key.key);
     let mut buffer = vec![0; 4 * 1024 * 1024];
     loop {
         let n = r.read(&mut buffer)?;
@@ -402,43 +388,25 @@ fn decrypt_file_after_header(
     }
     w.flush()?;
 
-    let digest = hmac.sum(&[]);
-    if iv[..NONCE_LEN] != digest[..NONCE_LEN] {
+    let new_digest = hmac.sum(&[]);
+    if new_digest[..HMAC_SIZE] != digest[..HMAC_SIZE] {
         return Err(new_other_err(
-            "encrypted file has been tampered with!".to_string(),
+            "decrypted file checksum doesn't match".to_string(),
         ));
     }
     Ok(())
 }
 
 /// Decrypt contents of stdin and write to stdout
-fn smudge(args: &[&str]) -> Result<(), Error> {
-    if !args.is_empty() {
-        eprintln!("parameters to smudge command are not supported");
-        std::process::exit(1);
-    }
-    let key = load_key()?;
-
-    // Read the header to get the nonce and make sure it's actually encrypted
-    let mut header = [0; ENCRYPTED_FILE_HEADER_SIZE];
-    let mut r = std::io::stdin().lock();
-    let n = r.read(&mut header)?;
-    if n != ENCRYPTED_FILE_HEADER_SIZE
-        || &header[..ENCRYPTED_FILE_MARKER_SIZE] != GITCRYPT_FILE_HEADER
-    {
+fn smudge() -> Result<(), Error> {
+    if !decrypt_file(
+        &load_key()?,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+    )? {
         eprintln!("git-rcrypt: Warning: file is not encrypted.");
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(&header[..n])?;
-        std::io::copy(&mut r, &mut stdout)?;
-        Ok(())
-    } else {
-        decrypt_file_after_header(
-            &key,
-            &header[ENCRYPTED_FILE_MARKER_SIZE..ENCRYPTED_FILE_HEADER_SIZE],
-            &mut r,
-            &mut std::io::stdout().lock(),
-        )
     }
+    Ok(())
 }
 
 fn diff(args: &[&str]) -> Result<(), Error> {
@@ -446,68 +414,35 @@ fn diff(args: &[&str]) -> Result<(), Error> {
         eprintln!("parameters to diff command are not supported");
         std::process::exit(1);
     }
-    let key = load_key()?;
-
-    let mut r = std::fs::File::open(args[0])?;
-
-    // Read the header to get the nonce and make sure it's actually encrypted
-    let mut header = [0; ENCRYPTED_FILE_HEADER_SIZE];
-    let n = r.read(&mut header)?;
-    if n != ENCRYPTED_FILE_HEADER_SIZE
-        || &header[..ENCRYPTED_FILE_MARKER_SIZE] != GITCRYPT_FILE_HEADER
-    {
-        // File not encrypted - just copy it out to stdout
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(&header[..n])?;
-        std::io::copy(&mut r, &mut stdout)?;
-        std::process::exit(0);
-    }
-
-    decrypt_file_after_header(
-        &key,
-        &header[ENCRYPTED_FILE_MARKER_SIZE..ENCRYPTED_FILE_HEADER_SIZE],
-        &mut r,
+    if !decrypt_file(
+        &load_key()?,
+        &mut std::fs::File::open(args[0])?,
         &mut std::io::stdout().lock(),
-    )?;
+    )? {
+        eprintln!("git-rcrypt: Warning: file is not encrypted.");
+    }
     Ok(())
 }
 
-fn help_init(w: &mut dyn std::io::Write) {
-    writeln!(w, "Usage: git-rcrypt init").unwrap();
-}
-
-fn init(args: &[&str]) -> Result<(), Error> {
-    if !args.is_empty() {
-        eprintln!("Error: git-rcrypt init takes no arguments");
-        help_init(&mut std::io::stderr().lock());
-        std::process::exit(2);
-    }
-
-    let key_path = get_internal_key_path()?;
+fn init() -> Result<(), Error> {
+    let key_path = get_key_path()?;
     if is_file(&key_path) {
         eprintln!("Error: this repository has already been initialized with git-rcrypt.");
         std::process::exit(1);
     }
 
-    // 1. Generate a key and install it
     let key = Key::generate()?;
-    std::fs::create_dir_all(get_internal_keys_path()?)?;
     key.store_to_file(key_path)?;
-
-    // 2. Configure git for git-rcrypt
     configure_git_filters()?;
-    Ok(())
-}
 
-fn help_unlock(w: &mut dyn std::io::Write) {
-    writeln!(
-        w,
-        r#"Usage: git-rcrypt unlock KEY_FILE
-
-If KEY_FILE is "-", the key will be read from the standard input.
+    eprintln!(
+        r#"The repository was initialized.
+Next:
+1) copy ".git/git-rcrypt.key" to a secure place
+2) create .gitattributes to tell git what files should be encrypted
 "#
-    )
-    .unwrap();
+    );
+    Ok(())
 }
 
 fn unlock(args: &[&str]) -> Result<(), Error> {
@@ -533,8 +468,7 @@ fn unlock(args: &[&str]) -> Result<(), Error> {
     } else {
         Key::load_from_file(key_path)?
     };
-    std::fs::create_dir_all(get_internal_keys_path()?)?;
-    key.store_to_file(get_internal_key_path()?)?;
+    key.store_to_file(get_key_path()?)?;
 
     // 3. Install the key(s) and configure the git filters
     configure_git_filters()?;
@@ -555,16 +489,7 @@ fn unlock(args: &[&str]) -> Result<(), Error> {
     Ok(())
 }
 
-fn help_lock(w: &mut dyn std::io::Write) {
-    writeln!(w, "Usage: git-rcrypt lock [OPTIONS]",).unwrap();
-}
-
-fn lock(args: &[&str]) -> Result<(), Error> {
-    if !args.is_empty() {
-        eprintln!("parameters to lock command are not supported");
-        std::process::exit(1);
-    }
-
+fn lock() -> Result<(), Error> {
     // 1. Make sure working directory is clean (ignoring untracked files)
     // We do this because we check out files later, and we don't want the
     // user to lose any changes.
@@ -581,7 +506,7 @@ Please commit your changes or 'git stash' them before running 'git-rcrypt lock'.
     }
 
     // 2. deconfigure the git filters and remove decrypted keys
-    let key_path = get_internal_key_path()?;
+    let key_path = get_key_path()?;
     if !is_file(&key_path) {
         eprintln!("Error: this repository is already locked");
         std::process::exit(1);
@@ -623,126 +548,26 @@ fn touch_file(path: &str) -> std::io::Result<()> {
     ggstd::os::chtimes(path, &now, &now)
 }
 
-const HMAC_KEY_LEN: usize = 64;
-const AES_KEY_LEN: usize = 32;
-
-fn malformed() -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "This repository contains a malformed key file.  It may be corrupted.".to_string(),
-    )
-}
-
-fn incompatible() -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "This repository contains a incompatible key file.".to_string(),
-    )
-}
-
-const KEY_FIELD_END: u32 = 0;
-const KEY_FIELD_VERSION: u32 = 1;
-const KEY_FIELD_AES_KEY: u32 = 3;
-const KEY_FIELD_HMAC_KEY: u32 = 5;
-
-const HEADER_FIELD_END: u32 = 0;
-const HEADER_FIELD_KEY_NAME: u32 = 1;
-
-const FORMAT_VERSION: u32 = 2;
-const MAX_FIELD_LEN: u32 = 1 << 20;
-
-const KEY_NAME_MAX_LEN: u32 = 128;
-
 #[derive(Debug)]
 struct Key {
-    aes_key: [u8; AES_KEY_LEN],
-    hmac_key: [u8; HMAC_KEY_LEN],
+    key: [u8; AES_KEY_SIZE],
 }
 
 impl Key {
     fn generate() -> std::io::Result<Self> {
-        let mut aes_key = [0; AES_KEY_LEN];
-        let mut hmac_key = [0; HMAC_KEY_LEN];
+        let mut aes_key = [0; AES_KEY_SIZE];
         rand::read(&mut aes_key)?;
-        rand::read(&mut hmac_key)?;
-        Ok(Self { aes_key, hmac_key })
+        Ok(Self { key: aes_key })
     }
 
     fn load(r: &mut dyn std::io::Read) -> std::io::Result<Self> {
-        let mut preamble = [0_u8; 12];
-        r.read_exact(&mut preamble)?;
-        if &preamble != b"\0GITCRYPTKEY" {
-            return Err(malformed());
-        }
-        if read_be32(r)? != FORMAT_VERSION {
-            return Err(incompatible());
-        }
-
-        Self::load_header(r)?;
-
-        let mut aes_key: Option<[u8; AES_KEY_LEN]> = None;
-        let mut hmac_key: Option<[u8; HMAC_KEY_LEN]> = None;
-        loop {
-            let field_id = read_be32(r)?;
-            if field_id == KEY_FIELD_END {
-                break;
-            }
-            let field_len = read_be32(r)?;
-            if field_id == KEY_FIELD_VERSION {
-                if field_len != 4 {
-                    return Err(malformed());
-                }
-                let version = read_be32(r)?;
-                if version != 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "Key entry with version!=0 are not supported (version: {})",
-                            version
-                        ),
-                    ));
-                }
-            } else if field_id == KEY_FIELD_AES_KEY {
-                if field_len as usize != AES_KEY_LEN {
-                    return Err(malformed());
-                }
-                let mut buf = [0; AES_KEY_LEN];
-                r.read_exact(&mut buf)?;
-                aes_key = Some(buf);
-            } else if field_id == KEY_FIELD_HMAC_KEY {
-                if field_len as usize != HMAC_KEY_LEN {
-                    return Err(malformed());
-                }
-                let mut buf = [0; HMAC_KEY_LEN];
-                r.read_exact(&mut buf)?;
-                hmac_key = Some(buf);
-            } else if field_id & 1 == 1 {
-                // unknown critical field
-                return Err(incompatible());
-            } else {
-                // unknown non-critical field - safe to ignore
-                if field_len > MAX_FIELD_LEN {
-                    return Err(malformed());
-                }
-                discard_exact(r, field_len as usize)?;
-            }
-        }
-
-        if aes_key.is_none() || hmac_key.is_none() {
-            return Err(malformed());
-        }
-        Ok(Self {
-            aes_key: aes_key.unwrap(),
-            hmac_key: hmac_key.unwrap(),
-        })
+        let mut aes_key = [0; AES_KEY_SIZE];
+        r.read_exact(&mut aes_key)?;
+        Ok(Self { key: aes_key })
     }
 
     fn store(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
-        w.write_all(b"\0GITCRYPTKEY")?;
-        write_be32(w, FORMAT_VERSION)?;
-        write_be32(w, HEADER_FIELD_END)?;
-        self.store_entry(w)?;
-        Ok(())
+        w.write_all(&self.key)
     }
 
     fn load_from_file<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<Self> {
@@ -764,62 +589,6 @@ impl Key {
         file.flush()?;
         Ok(())
     }
-
-    fn store_entry(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
-        write_be32(w, KEY_FIELD_VERSION)?;
-        write_be32(w, 4)?;
-        write_be32(w, 0)?;
-
-        write_be32(w, KEY_FIELD_AES_KEY)?;
-        write_be32(w, AES_KEY_LEN as u32)?;
-        w.write_all(&self.aes_key)?;
-
-        write_be32(w, KEY_FIELD_HMAC_KEY)?;
-        write_be32(w, HMAC_KEY_LEN as u32)?;
-        w.write_all(&self.hmac_key)?;
-
-        write_be32(w, KEY_FIELD_END)?;
-        Ok(())
-    }
-
-    fn load_header(r: &mut dyn std::io::Read) -> std::io::Result<()> {
-        loop {
-            let field_id = read_be32(r)?;
-            if field_id == HEADER_FIELD_END {
-                break;
-            }
-            let field_len = read_be32(r)?;
-            if field_id == HEADER_FIELD_KEY_NAME {
-                if field_len > KEY_NAME_MAX_LEN {
-                    return Err(malformed());
-                }
-                // not loading the name
-                discard_exact(r, field_len as usize)?;
-            } else if field_id & 1 != 0 {
-                // unknown critical field
-                return Err(incompatible());
-            } else {
-                // unknown non-critical field - safe to ignore
-                if field_len > MAX_FIELD_LEN {
-                    return Err(malformed());
-                }
-                discard_exact(r, field_len as usize)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-fn read_be32(r: &mut dyn std::io::Read) -> std::io::Result<u32> {
-    let mut buf = [0; 4];
-    r.read_exact(&mut buf)?;
-    Ok(BIG_ENDIAN.uint32(&buf))
-}
-
-fn write_be32(w: &mut dyn std::io::Write, value: u32) -> std::io::Result<()> {
-    let mut buf = [0; 4];
-    BIG_ENDIAN.put_uint32(&mut buf, value);
-    w.write_all(&buf)
 }
 
 fn escape_shell_arg(s: &str) -> String {
@@ -887,22 +656,6 @@ fn launch_and_write_to_stdin(
 //     println!("{:?}", output);
 // }
 
-/// discard_exact reads n bytes from the reader and discards them.
-fn discard_exact(r: &mut dyn Read, n: usize) -> std::io::Result<()> {
-    if n == 0 {
-        return Ok(());
-    }
-    let buf_size = n.min(64 * 1024);
-    let mut buf = vec![0; buf_size];
-    let mut n = n;
-    while n > 0 {
-        let size = n.min(buf_size);
-        r.read_exact(&mut buf[0..size])?;
-        n -= size;
-    }
-    Ok(())
-}
-
 /// Create and instance of std::io::Error with ErrorKind::Other.
 fn new_other_err<E>(message: E) -> std::io::Error
 where
@@ -920,75 +673,29 @@ mod test {
         assert_eq!(".", &get_path_to_top().unwrap());
     }
 
-    fn decrypt_file(
-        key: &Key,
-        r: &mut dyn std::io::Read,
-        w: &mut dyn std::io::Write,
-    ) -> std::io::Result<()> {
-        let mut header = [0; ENCRYPTED_FILE_HEADER_SIZE];
-        r.read_exact(&mut header)?;
-        if &header[0..ENCRYPTED_FILE_MARKER_SIZE] != GITCRYPT_FILE_HEADER {
-            return Err(new_other_err("invalid header".to_string()));
-        }
-        decrypt_file_after_header(
-            key,
-            &header[ENCRYPTED_FILE_MARKER_SIZE..ENCRYPTED_FILE_HEADER_SIZE],
-            r,
-            w,
-        )
-    }
-
     #[test]
     fn test_decrypt_file() {
-        let key = Key::load_from_file("testdata/01/key.bin").unwrap();
-        let mut f = std::fs::File::open("testdata/01/hello.txt_encrypted").unwrap();
+        let key = Key::load_from_file("testdata/02/key.bin").unwrap();
+        let mut f = std::fs::File::open("testdata/02/hello.txt_encrypted").unwrap();
         let mut w = std::io::Cursor::new(Vec::new());
         decrypt_file(&key, &mut f, &mut w).unwrap();
-        let want = std::fs::read("testdata/01/hello.txt_decrypted").unwrap();
+        let want = std::fs::read("testdata/02/hello.txt_decrypted").unwrap();
         assert_eq!(&want, w.get_ref());
     }
 
     #[test]
     fn test_encrypt_file() {
-        let key = Key::load_from_file("testdata/01/key.bin").unwrap();
-        let mut f = std::fs::File::open("testdata/01/hello.txt_decrypted").unwrap();
+        let key = Key::load_from_file("testdata/02/key.bin").unwrap();
+        let mut f = std::fs::File::open("testdata/02/hello.txt_decrypted").unwrap();
         let mut w = std::io::Cursor::new(Vec::new());
         encrypt_file(&key, &mut f, &mut w).unwrap();
-        let want = std::fs::read("testdata/01/hello.txt_encrypted").unwrap();
+        let want = std::fs::read("testdata/02/hello.txt_encrypted").unwrap();
         assert_eq!(&want, w.get_ref());
     }
 
     #[test]
     fn test_key_load() {
-        let mut f = std::fs::File::open("testdata/01/key.bin").unwrap();
+        let mut f = std::fs::File::open("testdata/02/key.bin").unwrap();
         let _k = Key::load(&mut f).unwrap();
-    }
-
-    #[test]
-    fn test_discard_exact() {
-        // reading a small buffer
-        {
-            let mut r = std::io::BufReader::new(&b"0123456789abcdef"[..]);
-            discard_exact(&mut r, 0).unwrap();
-            discard_exact(&mut r, 10).unwrap();
-            let mut buf = [0; 1];
-            r.read_exact(&mut buf[0..1]).unwrap();
-            assert_eq!(buf[0], b'a');
-            assert_eq!(
-                discard_exact(&mut r, 10).err().unwrap().kind(),
-                std::io::ErrorKind::UnexpectedEof
-            );
-        }
-
-        // big buffer
-        {
-            let mut read_buf = vec![0_u8; 1024 * 1024];
-            read_buf[512 * 1024] = 55;
-            let mut r = std::io::BufReader::new(&read_buf[..]);
-            discard_exact(&mut r, 512 * 1024 - 1).unwrap();
-            let mut buf = [0; 10];
-            r.read_exact(&mut buf).unwrap();
-            assert_eq!(buf[1], 55);
-        }
     }
 }
