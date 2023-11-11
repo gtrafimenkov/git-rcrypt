@@ -13,7 +13,7 @@ use ggstd::crypto::sha256;
 use ggstd::hash::Hash;
 use std::process::{Command, Stdio};
 
-const VERSION: &str = "0.0.2";
+const VERSION: &str = "0.0.3";
 
 fn print_usage(program_name: &str, out: &mut dyn std::io::Write) {
     writeln!(

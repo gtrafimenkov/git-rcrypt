@@ -12,7 +12,7 @@ Goals of the project:
 - install `git-rcrypt`:
 
 ```
-cargo install --git https://github.com/gtrafimenkov/git-rcrypt --tag v0.0.2
+cargo install --git https://github.com/gtrafimenkov/git-rcrypt --tag v0.0.3
 ```
 
 ## How to use
