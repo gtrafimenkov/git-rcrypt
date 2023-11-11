@@ -1,16 +1,14 @@
 # Next line instructs git to apply git-rcrypt filter to all files located
 # in directory e and below.  It means that all files in directory e will be
 # encrypted with git-rcrypt.
-e/** filter=git-rcrypt diff=git-rcrypt
+e/** filter=git-rcrypt diff=git-rcrypt -text
 
 # If you want to encrypt all files in the repository, uncomment following line
-# ** filter=git-rcrypt diff=git-rcrypt
+# * filter=git-rcrypt diff=git-rcrypt -text
 
 # Protection from accidental encryption of file .gitattributes
 .gitattributes !filter !diff
 
-# Documentaton: https://git-scm.com/docs/gitattributes
-
-# Treat all files in the repository as binary, with no git magic updating
-# line endings. This produces predictable results in different environments.
-* -text
+# Documentaton:
+#   - https://git-scm.com/docs/gitattributes
+#   - "-text" tells git to treat files as binary, with no git magic updating line endings
