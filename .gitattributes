@@ -10,3 +10,7 @@ e/** filter=git-rcrypt diff=git-rcrypt
 .gitattributes !filter !diff
 
 # Documentaton: https://git-scm.com/docs/gitattributes
+
+# Treat all files in the repository as binary, with no git magic updating
+# line endings. This produces predictable results in different environments.
+* -text
