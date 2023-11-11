@@ -414,13 +414,11 @@ fn diff(args: &[&str]) -> Result<(), Error> {
         eprintln!("parameters to diff command are not supported");
         std::process::exit(1);
     }
-    if !decrypt_file(
+    let _ = decrypt_file(
         &load_key()?,
         &mut std::fs::File::open(args[0])?,
         &mut std::io::stdout().lock(),
-    )? {
-        eprintln!("git-rcrypt: Warning: file is not encrypted.");
-    }
+    )?;
     Ok(())
 }
 
